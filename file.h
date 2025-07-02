@@ -12,7 +12,7 @@ std::pair<Graph, bool> load_graph() {
     //my-graph小图
     //my-subgraph可划分子图
 
-    auto path = "/home/sunnysab/Code/2-YTU/bap/dataset/USA-road-d.FLA.gr";
+    auto path = "/home/sunnysab/Code/2-YTU/bap/dataset/USA-road-d.NY.gr";
     // auto path = "dataset/ouyang-paper.gr";
     // auto path = "dataset/ppt.gr";
 

@@ -9,7 +9,7 @@ using namespace std;
 
 
 std::pair<std::vector<OnEdgePOI>, bool> load_objects() {
-    auto path = "/home/sunnysab/Code/2-YTU/bap/dataset/USA-road-d.FLA.mos.gr";
+    auto path = "/home/sunnysab/Code/2-YTU/bap/dataset/USA-road-d.NY.1000000.mos";
     // auto path = "dataset/ouyang-paper.co";
     // auto path = "dataset/ppt.co";
 
@@ -22,7 +22,6 @@ std::pair<std::vector<OnEdgePOI>, bool> load_objects() {
         return {obj_set, false};
     }
 
-    int expected_vertex_count = 0;
     for (string line; getline(file, line);) {
         stringstream ss(line); //ss的用法与cin/cout一样
 
@@ -33,10 +32,19 @@ std::pair<std::vector<OnEdgePOI>, bool> load_objects() {
         switch (operation) {
         case 'a': {
             Vertex v1, v2;
-            size_t offset;
+            Weight offset;
             ss >> v1 >> v2 >> offset;
+
+            OnEdgePOI poi {
+                .poi_id = static_cast<unsigned int>(obj_set.size() + 1), // 从1开始编号
+                .u = v1,
+                .v = v2,
+                .offset_from_u = offset
+            };
+            obj_set.push_back(poi);
             break;
         }
+        default: break;
         }
     }
 
