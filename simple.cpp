@@ -99,7 +99,7 @@ std::vector<QueryResult> find_k_nearest_neighbors_with_cache(
 
 int main(int argc, char* argv[]) {
     Vertex query_q = 10000;
-    constexpr int k1 = 5;
+    constexpr int k1 = 30;
     constexpr int k2 = 20; // k' > k
 
     // --- 1. 加载基础数据 ---

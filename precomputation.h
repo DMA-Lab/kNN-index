@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <atomic>
+#include <omp.h>
 #include "graph.h"
 
 // --- 类型定义 ---
@@ -97,42 +99,72 @@ std::vector<CachedNNResult> compute_k1_nn_for_vertex_offline(
     return results;
 }
 
+using CachedNNResult = std::pair<Weight, unsigned int>;
+using PrecomputationCacheFull = boost::unordered_flat_map<Vertex, std::vector<CachedNNResult>>;
+using POIInvertedIndex = boost::unordered_flat_map<Vertex, std::vector<const OnEdgePOI*>>;
+using PQEntry = std::pair<Weight, Vertex>;
+
+std::vector<CachedNNResult> compute_k1_nn_for_vertex_offline(const Graph&, const POIInvertedIndex&, Vertex, int); // 声明
+
 
 /**
- * @brief 暴力计算图中所有顶点的 k1-NN
+ * @brief 暴力计算图中所有顶点的 k1-NN (多核并行版本)
  */
 PrecomputationCacheFull compute_all_vertices_knn(
     const Graph& graph,
     const std::vector<OnEdgePOI>& pois,
     int k1)
 {
-    std::cout << "Starting full precomputation for all " << graph.num_vertex << " vertices..." << std::endl;
+    std::cout << "Starting full precomputation for all " << graph.num_vertex
+              << " vertices using " << omp_get_max_threads() << " threads..." << std::endl; // 显示线程数
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    // 1. 构建 POI 反向索引
     POIInvertedIndex poi_index;
     for (const auto& poi : pois) {
         poi_index[poi.u].push_back(&poi);
         poi_index[poi.v].push_back(&poi);
     }
-    
+
     PrecomputationCacheFull cache;
-    size_t processed_count = 0;
-    for (Vertex v : graph.vertices) {
-        cache[v] = compute_k1_nn_for_vertex_offline(graph, poi_index, v, k1);
-        processed_count++;
-        if (processed_count % 1000 == 0) {
-            std::cout << "\rProcessed " << processed_count << " / " << graph.num_vertex << " vertices..." << std::flush;
+    // <<< 3. 使用线程安全的原子计数器
+    std::atomic<size_t> processed_count = 0;
+
+    // 将图的顶点集转换为 vector，以便 OpenMP 能更好地进行并行化
+    std::vector<Vertex> vertices_vec(graph.vertices.begin(), graph.vertices.end());
+
+    // <<< 4. 使用 OpenMP 并行化 for 循环
+    #pragma omp parallel for schedule(dynamic)
+    for (int v : vertices_vec) {
+        // 每个线程独立计算一个顶点的kNN
+        auto result_list = compute_k1_nn_for_vertex_offline(graph, poi_index, v, k1);
+
+        // <<< 5. 使用 critical section 保护对共享 cache 的写入，防止数据竞争
+        #pragma omp critical
+        {
+            cache[v] = std::move(result_list);
+        }
+
+        // 更新进度计数器
+        size_t current_count = ++processed_count;
+        if (current_count % 1000 == 0) {
+            // 使用 \r 会导致多线程输出混乱，改为每1000次打印一行新状态
+            // 为了避免输出过于频繁，只让一个线程来打印
+            #pragma omp critical
+            {
+                // 再次检查，防止多个线程同时满足条件
+                if (current_count % 1000 == 0) {
+                     std::cout << "Processed " << current_count << " / " << graph.num_vertex << " vertices...\n";
+                }
+            }
         }
     }
-    
+
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> elapsed = end_time - start_time;
     std::cout << "\nFull precomputation finished in " << elapsed.count() / 1000.0 << " seconds." << std::endl;
 
     return cache;
 }
-
 
 /**
  * @brief 将预计算缓存写入文件
