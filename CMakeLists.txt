@@ -7,6 +7,7 @@ add_executable(kNN_Index main.cpp
     file.cpp graph.cpp)
 
 add_executable(simple-solution simple.cpp file.cpp graph.cpp)
+add_executable(test-connectivity test-connectivity.cpp file.cpp graph.cpp)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
