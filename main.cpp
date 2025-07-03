@@ -1,189 +1,133 @@
 #include <iostream>
-#include <ranges>
+#include <fstream>
 #include <vector>
 #include <queue>
 #include <algorithm>
 #include <utility>
-#include <set> // 使用 std::set 作为优先队列
-#include <chrono> // 添加计时功能
-#include <iomanip> // 用于格式化输出
+#include <set>
+#include <chrono>
+#include <iomanip>
+#include <functional>
+#include <ranges>
 #include "boost/unordered/unordered_flat_map.hpp"
 #include "boost/unordered/unordered_flat_set.hpp"
-#include "graph.h"
-#include "file.h"
+#include "graph.h" // 假设包含 Graph2 类定义
+#include "file.h"  // 假设包含 load_graph, load_objects
 
-// 计时器类
+// --- 辅助工具：计时器 ---
 class Timer {
 public:
     Timer() : start_time(std::chrono::high_resolution_clock::now()) {}
-    
-    // 重置计时器
-    void reset() {
-        start_time = std::chrono::high_resolution_clock::now();
-    }
-    
-    // 返回从创建或上次重置以来经过的时间（秒）
+    void reset() { start_time = std::chrono::high_resolution_clock::now(); }
     double elapsed() const {
-        auto now = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> diff = now - start_time;
-        return diff.count();
+        return std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_time).count();
     }
-    
-    // 打印经过的时间并返回秒数
-    double print_elapsed(const std::string& prefix = "") const {
-        double seconds = elapsed();
-        std::cout << prefix << std::fixed << std::setprecision(3) 
-                  << seconds << " 秒" << std::endl;
-        return seconds;
+    void print_elapsed(const std::string& prefix = "") const {
+        std::cout << prefix << std::fixed << std::setprecision(4) << elapsed() << " 秒" << std::endl;
     }
-
 private:
     std::chrono::time_point<std::chrono::high_resolution_clock> start_time;
 };
 
-// --- kNN 相关数据结构 ---
+// --- 核心数据结构 ---
+
+// kNN查询结果中的一个邻居
 struct Neighbor {
-    Vertex id;
+    unsigned int id; // 对象的唯一ID (poi_id)
     Weight dist;
     bool operator>(const Neighbor& other) const { return dist > other.dist; }
     bool operator<(const Neighbor& other) const { return dist < other.dist; }
 };
 using KnnResult = std::vector<Neighbor>;
 
+// 用于从文件加载的原始对象结构
+struct LoadedObject {
+    unsigned int poi_id;
+    Vertex u, v;
+    double ratio;
+};
 
-/**
- * @brief 创建增强图，将边上对象转换为新顶点
- * @param original_graph 原始路网图
- * @param pois 边上对象列表
- * @param poi_vertex_start_id 新的 POI 顶点 ID 的起始编号，必须大于原始图中最大的顶点ID
- * @return 一个包含增强图和新候选对象集的 pair
- */
+// --- 1. 静态的、可持久化的 V2V (Vertex-to-Vertex) 索引 ---
 template <typename Graph>
-std::pair<Graph, boost::unordered_flat_set<Vertex>>
-create_augmented_graph(
-    const Graph& original_graph,
-    const std::vector<OnEdgePOI>& pois,
-    Vertex poi_vertex_start_id
-) {
-    std::cout << "创建增强图中..." << std::endl;
-    Timer timer;
-    
-    Graph augmented_graph = original_graph;
-    boost::unordered_flat_set<Vertex> new_candidate_objects;
-
-    Vertex current_new_vertex_id = poi_vertex_start_id;
-    for (const auto& poi : pois) {
-        Vertex new_poi_vertex = current_new_vertex_id++;
-
-        augmented_graph.insert(new_poi_vertex);
-        new_candidate_objects.insert(new_poi_vertex);
-
-        Vertex u = poi.u;
-        Vertex v = poi.v;
-        Weight original_weight = original_graph.get_weight(u, v);
-
-        // 断开原始边，连接到新顶点
-        augmented_graph.disconnect(u, v);
-        augmented_graph.connect(u, new_poi_vertex, poi.offset_from_u);
-        augmented_graph.connect(new_poi_vertex, v, original_weight - poi.offset_from_u);
-        std::cout << "  - POI " << poi.poi_id << " 已作为新顶点 " << new_poi_vertex << " 嵌入图中。" << std::endl;
-    }
-
-    std::cout << "增强图创建完毕。新图顶点数: " << augmented_graph.num_vertex << std::endl;
-    timer.print_elapsed("增强图创建耗时: ");
-    return {augmented_graph, new_candidate_objects};
-}
-
-
-// --- KnnIndex 类定义 ---
-// 这个类现在将直接在增强图上工作，其内部逻辑无需改变。
-template <typename Graph>
-class KnnIndex {
+class V2VIndex {
 public:
-    KnnIndex(const Graph& g, int k, const boost::unordered_flat_set<Vertex>& objects);
-    void build_index();
-    [[nodiscard]] KnnResult get_knn(Vertex u) const;
+    V2VIndex() = default; // for loading
+    V2VIndex(const Graph& g, int k);
+
+    void build();
+    bool save(const std::string& path) const;
+    bool load(const std::string& path, const Graph& g); // 需要原始图来恢复BN-Graph
+
+    int get_index_k() const { return k_index_; }
+    const std::vector<std::pair<Vertex, Weight>>& get_vertex_knn(Vertex u) const;
+    const Graph& get_graph() const { return *graph_ptr_; }
 
 private:
-    const Graph& graph_;
-    const int k_;
-    boost::unordered_flat_set<Vertex> candidate_objects_;
+    void generate_vertex_order();
+    void build_bn_graph();
+    void build_vertex_knn_cache();
+
+    const Graph* graph_ptr_ = nullptr; // 指向原始图
+    int k_index_ = 0;
 
     Graph bn_graph_;
     std::vector<Vertex> vertex_order_pi_;
-    boost::unordered_flat_map<Vertex, KnnResult> knn_index_;
+    boost::unordered_flat_map<Vertex, std::vector<std::pair<Vertex, Weight>>> vertex_knn_cache_;
 
-    void generate_vertex_order();
-    void build_bn_graph();
-    void build_index_internal();
-    boost::unordered_flat_map<Vertex, KnnResult> build_partial_knn();
+    // 用于load时返回空vector的静态成员
+    inline static const std::vector<std::pair<Vertex, Weight>> empty_v_knn_{};
 };
 
-// KnnIndex 类的实现...
-// (这部分代码与上一版基本相同，因为它现在操作的是一个所有对象都已是顶点的图)
 template <typename Graph>
-KnnIndex<Graph>::KnnIndex(const Graph& g, int k, const boost::unordered_flat_set<Vertex>& objects)
-    : graph_(g), k_(k), candidate_objects_(objects) {
-    if (candidate_objects_.empty()) {
-        for (const auto& v : graph_.vertices) {
-            candidate_objects_.insert(v);
-        }
+V2VIndex<Graph>::V2VIndex(const Graph& g, int k) : graph_ptr_(&g), k_index_(k) {}
+
+template <typename Graph>
+const std::vector<std::pair<Vertex, Weight>>& V2VIndex<Graph>::get_vertex_knn(Vertex u) const {
+    auto it = vertex_knn_cache_.find(u);
+    if (it != vertex_knn_cache_.end()) {
+        return it->second;
     }
+    return empty_v_knn_;
 }
 
 template <typename Graph>
-void KnnIndex<Graph>::build_index() {
-    std::cout << "开始在图上构建 kNN 索引..." << std::endl;
-    std::cout << "  - 图顶点数: " << graph_.num_vertex << std::endl;
-    std::cout << "  - 候选对象数: " << candidate_objects_.size() << std::endl;
+void V2VIndex<Graph>::build() {
+    if (!graph_ptr_ || k_index_ <= 0) {
+        std::cerr << "[错误] V2VIndex 未正确初始化！" << std::endl;
+        return;
+    }
+    std::cout << "开始构建 V2V 索引 (k=" << k_index_ << ")..." << std::endl;
     Timer total_timer;
 
     std::cout << "  (1/3) 生成顶点排序..." << std::endl;
-    Timer step_timer;
     generate_vertex_order();
-    step_timer.print_elapsed("    顶点排序耗时: ");
 
-    std::cout << "  (2/3) 构建桥接邻居保留图 (BN-Graph)..." << std::endl;
-    step_timer.reset();
+    std::cout << "  (2/3) 构建 BN-Graph..." << std::endl;
     build_bn_graph();
-    step_timer.print_elapsed("    BN-Graph构建总耗时: ");
 
-    std::cout << "  (3/3) 运行双向算法填充索引..." << std::endl;
-    step_timer.reset();
-    build_index_internal();
-    step_timer.print_elapsed("    索引填充耗时: ");
+    std::cout << "  (3/3) 构建 V-V kNN 缓存..." << std::endl;
+    build_vertex_knn_cache();
 
-    std::cout << "kNN 索引构建完成！" << std::endl;
-    total_timer.print_elapsed("索引构建总耗时: ");
+    total_timer.print_elapsed("V2V 索引构建总耗时: ");
 }
 
 template <typename Graph>
-KnnResult KnnIndex<Graph>::get_knn(Vertex u) const {
-    Timer timer;
-    auto it = knn_index_.find(u);
-    KnnResult result;
-    if (it != knn_index_.end()) {
-        result = it->second;
-    }
-    timer.print_elapsed("kNN查询耗时: ");
-    return result;
-}
+void V2VIndex<Graph>::generate_vertex_order() {
+    if (!graph_ptr_) return;
+    const Graph& g = *graph_ptr_;
 
-template <typename Graph>
-void KnnIndex<Graph>::generate_vertex_order() {
-    // MODIFIED: Replaced O(N^2) linear scan with an O(N log N) priority queue approach.
-    vertex_order_pi_.reserve(graph_.num_vertex);
+    vertex_order_pi_.reserve(g.num_vertex);
 
     // 用来追踪每个顶点的当前度数
     boost::unordered_flat_map<Vertex, int> current_degrees;
-    // 使用 std::set 模拟一个优先队列，它会根据度数自动排序
+    // 使用 std::set 模拟一个优先队列，它会根据度数和顶点ID自动排序
     // pair: {degree, vertex_id}
     std::set<std::pair<int, Vertex>> degree_pq;
 
     // 初始化度数和优先队列
-    for (const auto& v : graph_.vertices) {
-        if (v == 0) continue; // 遵守规则：顶点0是无效的
-        int degree = graph_.out_degree(v);
+    for (const auto& v : g.vertices) {
+        if (v == 0) continue; // 假设顶点0无效或不存在
+        int degree = g.out_degree(v);
         current_degrees[v] = degree;
         degree_pq.insert({degree, v});
     }
@@ -199,18 +143,12 @@ void KnnIndex<Graph>::generate_vertex_order() {
         vertex_order_pi_.push_back(best_v);
 
         // 更新其邻居的度数
-        for (const auto& neighbor_pair : graph_.get_adjacent_vertices(best_v)) {
-            Vertex neighbor_v = neighbor_pair.first;
-
+        for (const auto& [neighbor_v, _] : g.get_adjacent_vertices(best_v)) {
             // 如果邻居在我们的追踪列表里 (即它是一个有效的、未处理的顶点)
             if (current_degrees.count(neighbor_v)) {
                 // 在优先队列中更新一个元素的最高效方法是：删除旧的，插入新的
-
-                // 1. 删除旧的条目
                 if (degree_pq.erase({current_degrees[neighbor_v], neighbor_v})) {
-                    // 2. 更新度数
-                    current_degrees[neighbor_v]--;
-                    // 3. 插入新条目
+                    --current_degrees[neighbor_v];
                     degree_pq.insert({current_degrees[neighbor_v], neighbor_v});
                 }
             }
@@ -221,9 +159,12 @@ void KnnIndex<Graph>::generate_vertex_order() {
 }
 
 template <typename Graph>
-void KnnIndex<Graph>::build_bn_graph() {
+void V2VIndex<Graph>::build_bn_graph() {
+    if (!graph_ptr_) return;
+    const Graph& g = *graph_ptr_;
+
     // 初始化 BN-Graph 为原始图的副本
-    bn_graph_ = graph_;
+    bn_graph_ = g;
 
     // 创建一个从顶点ID到其在排序中位置（rank）的映射，方便快速查找
     boost::unordered_flat_map<Vertex, int> rank;
@@ -232,25 +173,18 @@ void KnnIndex<Graph>::build_bn_graph() {
     }
 
     // --- 步骤 1: 边插入 (Edge Insertion) ---
-    // 按顶点排序的升序遍历 (w 的 rank 从低到高)
-    std::cout << "    - BN-Graph: Running Edge Insertion..." << std::endl;
-    Timer edge_insertion_timer;
     for (const auto& w : vertex_order_pi_) {
         std::vector<Vertex> higher_rank_neighbors;
-        // 找到所有 rank 比 w 高的邻居
-        for (const auto& neighbor_pair : bn_graph_.get_adjacent_vertices(w)) {
-            Vertex neighbor = neighbor_pair.first;
+        for (const auto& [neighbor, _] : bn_graph_.get_adjacent_vertices(w)) {
             if (rank.count(neighbor) && rank.at(neighbor) > rank.at(w)) {
                 higher_rank_neighbors.push_back(neighbor);
             }
         }
 
-        // 为这些高阶邻居两两之间添加快捷方式边
         for (size_t i = 0; i < higher_rank_neighbors.size(); ++i) {
             for (size_t j = i + 1; j < higher_rank_neighbors.size(); ++j) {
                 Vertex u = higher_rank_neighbors[i];
                 Vertex v = higher_rank_neighbors[j];
-                // 路径 u -> w -> v 的长度
                 Weight new_dist = bn_graph_.get_weight(u, w) + bn_graph_.get_weight(w, v);
                 if (!bn_graph_.has_edge(u, v) || new_dist < bn_graph_.get_weight(u, v)) {
                     bn_graph_.connect(u, v, new_dist);
@@ -258,225 +192,380 @@ void KnnIndex<Graph>::build_bn_graph() {
             }
         }
     }
-    edge_insertion_timer.print_elapsed("      边插入耗时: ");
 
     // --- 步骤 2: 边删除/剪枝 (Edge Deletion) ---
-    // 这是新增的部分，对应论文算法1的第10-16行
-    std::cout << "    - BN-Graph: Running Edge Deletion/Pruning..." << std::endl;
-    Timer edge_deletion_timer;
-    
-    // 使用一个集合来存储待删除的边，避免在遍历时直接修改图结构
     boost::unordered_flat_set<std::pair<Vertex, Vertex>> edges_to_remove;
-
-    // 按顶点排序的降序遍历 (w 的 rank 从高到低)
     for (int w : std::ranges::reverse_view(vertex_order_pi_)) {
         std::vector<Vertex> higher_rank_neighbors;
-        // 同样，找到所有 rank 比 w 高的邻居
-        for (const auto& neighbor_pair : bn_graph_.get_adjacent_vertices(w)) {
-            Vertex neighbor = neighbor_pair.first;
+        for (const auto& [neighbor, _] : bn_graph_.get_adjacent_vertices(w)) {
             if (rank.count(neighbor) && rank.at(neighbor) > rank.at(w)) {
                 higher_rank_neighbors.push_back(neighbor);
             }
         }
 
-        // 检查这些高阶邻居，利用三角不等式进行剪枝
         for (size_t i = 0; i < higher_rank_neighbors.size(); ++i) {
             for (size_t j = i + 1; j < higher_rank_neighbors.size(); ++j) {
                 Vertex u = higher_rank_neighbors[i];
                 Vertex v = higher_rank_neighbors[j];
 
-                // 检查路径 w -> u -> v 是否比 w -> v 更优
-                // 注意：由于图是无向的，我们需要检查两个方向
-                // 论文伪代码中 `phi((w, v), G') + phi((v, u), G') < phi((w, u), G')`
-                // 对应到我们的实现就是 dist(w,v) + dist(v,u) < dist(w,u)
-
                 Weight dist_wu = bn_graph_.get_weight(w, u);
                 Weight dist_wv = bn_graph_.get_weight(w, v);
                 Weight dist_uv = bn_graph_.get_weight(u, v);
 
-                // 检查路径 w-v-u 是否可以优化 w-u
                 if (dist_wv + dist_uv < dist_wu) {
-                    // 如果是，说明边(w, u)是冗余的，可以被移除
-                    // 为了保证对称性，我们对顶点ID排序来规范化pair
                     edges_to_remove.insert({std::min(w, u), std::max(w, u)});
                 }
-
-                // 检查路径 w-u-v 是否可以优化 w-v
                 if (dist_wu + dist_uv < dist_wv) {
-                    // 如果是，说明边(w, v)是冗余的，可以被移除
                     edges_to_remove.insert({std::min(w, v), std::max(w, v)});
                 }
             }
         }
     }
 
-    // 最后，从图中实际删除所有被标记的边
     if (!edges_to_remove.empty()) {
-        std::cout << "    - Pruning " << edges_to_remove.size() << " redundant edges from BN-Graph." << std::endl;
+        std::cout << "    - 剪枝 " << edges_to_remove.size() << " 条冗余边从 BN-Graph." << std::endl;
         for (const auto& edge_pair : edges_to_remove) {
             bn_graph_.disconnect(edge_pair.first, edge_pair.second);
         }
     }
-    edge_deletion_timer.print_elapsed("      边删除/剪枝耗时: ");
 }
 
 template <typename Graph>
-boost::unordered_flat_map<Vertex, KnnResult> KnnIndex<Graph>::build_partial_knn() {
-    Timer timer;
-    boost::unordered_flat_map<Vertex, KnnResult> partial_knn_map;
+void V2VIndex<Graph>::build_vertex_knn_cache() {
     boost::unordered_flat_map<Vertex, int> rank;
     for (size_t i = 0; i < vertex_order_pi_.size(); ++i) {
         rank[vertex_order_pi_[i]] = i;
     }
+
+    using VertexNeighbor = std::pair<Vertex, Weight>;
+
+    // --- 阶段 1: 自底向上计算 partial V-V kNN ---
+    // 使用最大堆（按距离比较）来维护k个最近的顶点邻居
+    auto max_heap_comp = [](const VertexNeighbor& a, const VertexNeighbor& b) { return a.second < b.second; };
+    using MaxHeap = std::priority_queue<VertexNeighbor, std::vector<VertexNeighbor>, decltype(max_heap_comp)>;
+
+    boost::unordered_flat_map<Vertex, std::vector<VertexNeighbor>> partial_v_knn;
 
     for (const auto& u : vertex_order_pi_) {
-        std::priority_queue<Neighbor> max_heap;
-        if (candidate_objects_.count(u)) {
-            max_heap.push({u, 0});
-        }
+        MaxHeap max_heap(max_heap_comp);
+        max_heap.push({u, 0}); // 到自身的距离为0
 
-        for (const auto& v_pair : bn_graph_.get_adjacent_vertices(u)) {
-            Vertex v = v_pair.first;
+        // 从低阶邻居 v 传播 kNN 结果
+        for (const auto& [v, w_uv] : bn_graph_.get_adjacent_vertices(u)) {
             if (!rank.count(v) || rank.at(v) > rank.at(u)) continue;
+            if (!partial_v_knn.count(v)) continue;
 
-            if (partial_knn_map.count(v)) {
-                for (const auto& neighbor_of_v : partial_knn_map.at(v)) {
-                    Weight new_dist = bn_graph_.get_weight(u, v) + neighbor_of_v.dist;
-                    if (max_heap.size() < static_cast<size_t>(k_)) {
-                        max_heap.push({neighbor_of_v.id, new_dist});
-                    } else if (new_dist < max_heap.top().dist) {
-                        max_heap.pop();
-                        max_heap.push({neighbor_of_v.id, new_dist});
-                    }
+            for (const auto& [neighbor_of_v, dist_vn] : partial_v_knn.at(v)) {
+                Weight new_dist = w_uv + dist_vn;
+                if (max_heap.size() < static_cast<size_t>(k_index_)) {
+                    max_heap.push({neighbor_of_v, new_dist});
+                } else if (new_dist < max_heap.top().second) {
+                    max_heap.pop();
+                    max_heap.push({neighbor_of_v, new_dist});
                 }
             }
         }
 
-        KnnResult partial_knn;
+        std::vector<VertexNeighbor> result;
+        result.reserve(max_heap.size());
         while (!max_heap.empty()) {
-            partial_knn.push_back(max_heap.top());
+            result.push_back(max_heap.top());
             max_heap.pop();
         }
-        std::sort(partial_knn.begin(), partial_knn.end());
-        partial_knn_map[u] = partial_knn;
+        std::sort(result.begin(), result.end(), [](const auto& a, const auto& b){ return a.second < b.second; });
+        partial_v_knn[u] = std::move(result);
     }
-    timer.print_elapsed("    部分kNN构建耗时: ");
-    return partial_knn_map;
+
+    // --- 阶段 2: 自顶向下计算最终 V-V kNN ---
+    // 使用最小堆来合并多个有序列表
+    auto min_heap_comp = [](const VertexNeighbor& a, const VertexNeighbor& b) { return a.second > b.second; };
+    using MinHeap = std::priority_queue<VertexNeighbor, std::vector<VertexNeighbor>, decltype(min_heap_comp)>;
+
+    for (int u : std::ranges::reverse_view(vertex_order_pi_)) {
+        MinHeap min_heap(min_heap_comp);
+        boost::unordered_flat_set<Vertex> visited; // 用于合并时去重
+
+        // 1. 加入来自 partial_knn 的结果
+        if (partial_v_knn.count(u)) {
+            for (const auto& neighbor : partial_v_knn.at(u)) {
+                min_heap.push(neighbor);
+                visited.insert(neighbor.first);
+            }
+        }
+
+        // 2. 加入来自高阶邻居 w 的最终 kNN 结果
+        for (const auto& [w, w_uw] : bn_graph_.get_adjacent_vertices(u)) {
+            if (!rank.count(w) || rank.at(w) < rank.at(u)) continue;
+            if (!vertex_knn_cache_.count(w)) continue;
+
+            for (const auto& [neighbor_of_w, dist_wn] : vertex_knn_cache_.at(w)) {
+                if (!visited.count(neighbor_of_w)) {
+                    min_heap.push({neighbor_of_w, w_uw + dist_wn});
+                    visited.insert(neighbor_of_w);
+                }
+            }
+        }
+
+        // 从合并后的结果中选出最终的 Top-K
+        std::vector<VertexNeighbor> final_knn;
+        final_knn.reserve(k_index_);
+        boost::unordered_flat_set<Vertex> final_visited_ids;
+        while (!min_heap.empty() && final_knn.size() < static_cast<size_t>(k_index_)) {
+            VertexNeighbor top = min_heap.top();
+            min_heap.pop();
+            if(!final_visited_ids.count(top.first)){
+               final_knn.push_back(top);
+               final_visited_ids.insert(top.first);
+            }
+        }
+        vertex_knn_cache_[u] = std::move(final_knn);
+    }
 }
 
 template <typename Graph>
-void KnnIndex<Graph>::build_index_internal() {
-    auto partial_knn_map = build_partial_knn();
-    Timer timer;
-    
-    boost::unordered_flat_map<Vertex, int> rank;
-    for (size_t i = 0; i < vertex_order_pi_.size(); ++i) {
-        rank[vertex_order_pi_[i]] = i;
+bool V2VIndex<Graph>::save(const std::string& path) const {
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) {
+        std::cerr << "[错误] 无法打开文件进行写入: " << path << std::endl;
+        return false;
     }
 
-    for (auto it = vertex_order_pi_.rbegin(); it != vertex_order_pi_.rend(); ++it) {
-        Vertex u = *it;
-        std::priority_queue<Neighbor, std::vector<Neighbor>, std::greater<Neighbor>> min_heap;
-        boost::unordered_flat_set<Vertex> visited_neighbors;
+    // 写入元数据
+    ofs.write(reinterpret_cast<const char*>(&k_index_), sizeof(k_index_));
 
-        if (partial_knn_map.count(u)) {
-            for (const auto& neighbor : partial_knn_map.at(u)) {
-                min_heap.push(neighbor);
-                visited_neighbors.insert(neighbor.id);
+    // 写入 vertex_order_pi_
+    size_t pi_size = vertex_order_pi_.size();
+    ofs.write(reinterpret_cast<const char*>(&pi_size), sizeof(pi_size));
+    ofs.write(reinterpret_cast<const char*>(vertex_order_pi_.data()), pi_size * sizeof(Vertex));
+
+    // 写入 vertex_knn_cache_
+    size_t cache_size = vertex_knn_cache_.size();
+    ofs.write(reinterpret_cast<const char*>(&cache_size), sizeof(cache_size));
+    for (const auto& [u, neighbors] : vertex_knn_cache_) {
+        ofs.write(reinterpret_cast<const char*>(&u), sizeof(u));
+        size_t neighbors_size = neighbors.size();
+        ofs.write(reinterpret_cast<const char*>(&neighbors_size), sizeof(neighbors_size));
+        ofs.write(reinterpret_cast<const char*>(neighbors.data()), neighbors_size * sizeof(std::pair<Vertex, Weight>));
+    }
+
+    std::cout << "V2V 索引已成功保存到: " << path << std::endl;
+    return true;
+}
+
+template <typename Graph>
+bool V2VIndex<Graph>::load(const std::string& path, const Graph& g) {
+    std::ifstream ifs;
+    ifs.exceptions(std::ifstream::failbit | std::ifstream::badbit); // 设置异常处理
+    ifs.open(path, std::ios::binary);
+
+    graph_ptr_ = &g;
+
+    // 读取元数据并检查
+    if (!ifs.read(reinterpret_cast<char*>(&k_index_), sizeof(k_index_))) return false;
+
+    // 读取 vertex_order_pi_
+    size_t pi_size;
+    ifs.read(reinterpret_cast<char*>(&pi_size), sizeof(pi_size));
+    vertex_order_pi_.resize(pi_size);
+    ifs.read(reinterpret_cast<char*>(vertex_order_pi_.data()), pi_size * sizeof(Vertex));
+
+    // 重建 BN-Graph (必须，因为查询处理器可能需要)
+    std::cout << "从加载的数据重建 BN-Graph..." << std::endl;
+    build_bn_graph();
+
+    // 读取 vertex_knn_cache_
+    size_t cache_size;
+    ifs.read(reinterpret_cast<char*>(&cache_size), sizeof(cache_size));
+    vertex_knn_cache_.reserve(cache_size);
+    for (size_t i = 0; i < cache_size; ++i) {
+        Vertex u;
+        ifs.read(reinterpret_cast<char*>(&u), sizeof(u));
+        size_t neighbors_size;
+        ifs.read(reinterpret_cast<char*>(&neighbors_size), sizeof(neighbors_size));
+        std::vector<std::pair<Vertex, Weight>> neighbors(neighbors_size);
+        ifs.read(reinterpret_cast<char*>(neighbors.data()), neighbors_size * sizeof(std::pair<Vertex, Weight>));
+        vertex_knn_cache_[u] = std::move(neighbors);
+    }
+
+    std::cout << "V2V 索引已成功从 " << path << " 加载 (k=" << k_index_ << ")" << std::endl;
+    return true;
+}
+
+
+// --- 2. 动态的 kNN 查询处理器 ---
+template <typename Graph>
+class KnnQueryProcessor {
+public:
+    KnnQueryProcessor(const V2VIndex<Graph>& index);
+    KnnResult query(Vertex query_point, const std::vector<OnEdgePOI>& pois, int k_query) const;
+
+private:
+    const V2VIndex<Graph>& index_;
+    boost::unordered_flat_map<Vertex, std::vector<size_t>> build_poi_map(const std::vector<OnEdgePOI>& pois) const;
+};
+
+template <typename Graph>
+KnnQueryProcessor<Graph>::KnnQueryProcessor(const V2VIndex<Graph>& index) : index_(index) {}
+
+template<typename Graph>
+boost::unordered_flat_map<Vertex, std::vector<size_t>> KnnQueryProcessor<Graph>::build_poi_map(const std::vector<OnEdgePOI>& pois) const {
+    boost::unordered_flat_map<Vertex, std::vector<size_t>> poi_map;
+    for (size_t i = 0; i < pois.size(); ++i) {
+        poi_map[pois[i].u].push_back(i);
+        poi_map[pois[i].v].push_back(i);
+    }
+    return poi_map;
+}
+
+template <typename Graph>
+KnnResult KnnQueryProcessor<Graph>::query(Vertex query_point, const std::vector<OnEdgePOI>& pois, int k_query) const {
+    Timer query_timer;
+    std::cout << "执行查询: u=" << query_point << ", k=" << k_query << ", POI数量=" << pois.size() << std::endl;
+
+    // 动态构建本次查询的 POI 反向索引
+    auto poi_map = build_poi_map(pois);
+
+    std::priority_queue<Neighbor> max_heap;
+
+    // --- 阶段1: 利用 V2V 索引进行初步查询 ---
+    std::cout << "  - 阶段1: 使用 V2V 索引 (k=" << index_.get_index_k() << ") 查找种子结果..." << std::endl;
+    const auto& nearest_vertices = index_.get_vertex_knn(query_point);
+    for (const auto& [v, dist_uv] : nearest_vertices) {
+        if (!poi_map.count(v)) continue;
+
+        for (size_t poi_idx : poi_map.at(v)) {
+            const auto& poi = pois[poi_idx];
+            Weight total_dist = dist_uv;
+            if (poi.u == v) {
+                total_dist += poi.offset_from_u;
+            } else {
+                total_dist += (index_.get_graph().get_weight(poi.u, poi.v) - poi.offset_from_u);
+            }
+            if (max_heap.size() < static_cast<size_t>(k_query)) {
+                max_heap.push({poi.poi_id, total_dist});
+            } else if (total_dist < max_heap.top().dist) {
+                max_heap.pop();
+                max_heap.push({poi.poi_id, total_dist});
             }
         }
+    }
 
-        for (const auto& w_pair : bn_graph_.get_adjacent_vertices(u)) {
-            Vertex w = w_pair.first;
-            if (!rank.count(w) || rank.at(w) < rank.at(u)) continue;
+    // --- 阶段2: 如果需要，使用 Dijkstra 进行回退查询 ---
+    if (k_query > index_.get_index_k()) {
+        std::cout << "  - 阶段2: 查询k > 索引k，启动 Dijkstra 回退..." << std::endl;
+        Weight search_bound = std::numeric_limits<Weight>::max();
+        if (max_heap.size() == static_cast<size_t>(k_query)) {
+            search_bound = max_heap.top().dist;
+        }
 
-            if (knn_index_.count(w)) {
-                for (const auto& neighbor_of_w : knn_index_.at(w)) {
-                    if (visited_neighbors.find(neighbor_of_w.id) == visited_neighbors.end()) {
-                        Weight new_dist = bn_graph_.get_weight(u, w) + neighbor_of_w.dist;
-                        min_heap.push({neighbor_of_w.id, new_dist});
-                        visited_neighbors.insert(neighbor_of_w.id);
+        using DijkstraState = std::pair<Weight, Vertex>;
+        std::priority_queue<DijkstraState, std::vector<DijkstraState>, std::greater<DijkstraState>> pq;
+        boost::unordered_flat_map<Vertex, Weight> dists;
+
+        pq.push({0, query_point});
+        dists[query_point] = 0;
+
+        while (!pq.empty()) {
+            auto [dist, u] = pq.top();
+            pq.pop();
+
+            if (dist > dists[u]) continue;
+            if (dist > search_bound) break; // 剪枝
+
+            // 检查附着在u上的POI
+            if (poi_map.count(u)) {
+                for (size_t poi_idx : poi_map.at(u)) {
+                    const auto& poi = pois[poi_idx];
+                    Weight total_dist = dist;
+                     if (poi.u == u) {
+                        total_dist += poi.offset_from_u;
+                    } else {
+                        total_dist += (index_.get_graph().get_weight(poi.u, poi.v) - poi.offset_from_u);
+                    }
+
+                    if (max_heap.size() < static_cast<size_t>(k_query)) {
+                        max_heap.push({poi.poi_id, total_dist});
+                         if(max_heap.size() == static_cast<size_t>(k_query)) search_bound = max_heap.top().dist;
+                    } else if (total_dist < max_heap.top().dist) {
+                        max_heap.pop();
+                        max_heap.push({poi.poi_id, total_dist});
+                        search_bound = max_heap.top().dist;
                     }
                 }
             }
-        }
 
-        KnnResult final_knn;
-        boost::unordered_flat_set<Vertex> final_visited;
-        while (!min_heap.empty() && final_knn.size() < static_cast<size_t>(k_)) {
-            Neighbor top = min_heap.top();
-            min_heap.pop();
-            if(final_visited.find(top.id) == final_visited.end()){
-               final_knn.push_back(top);
-               final_visited.insert(top.id);
+            // 扩展邻居
+            for (const auto& [v, weight] : index_.get_graph().get_adjacent_vertices(u)) {
+                if (!dists.count(v) || dists.at(v) > dist + weight) {
+                    dists[v] = dist + weight;
+                    pq.push({dists[v], v});
+                }
             }
         }
-        knn_index_[u] = final_knn;
     }
-    timer.print_elapsed("    最终索引构建耗时: ");
+
+    // --- 整理并返回结果 ---
+    KnnResult final_result;
+    while (!max_heap.empty()) {
+        final_result.push_back(max_heap.top());
+        max_heap.pop();
+    }
+    std::sort(final_result.begin(), final_result.end());
+
+    query_timer.print_elapsed("总查询耗时: ");
+    return final_result;
 }
 
+// --- main 函数：演示工作流 ---
 int main() {
-    Timer total_timer;
-    
-    std::cout << "开始加载图数据..." << std::endl;
-    Timer load_timer;
+    const std::string INDEX_FILE = "v2v_index.bin";
+    const int K_INDEX = 50; // 构建索引时使用的k，应该比通常查询的k大
+
+    // 1. 加载图
     auto [g, success] = load_graph<Graph2>();
-    if (!success) {
-        std::cerr << "加载图失败！" << std::endl;
-        return 1;
+    if (!success) return 1;
+
+    // 2. 构建或加载 V2V 索引
+    V2VIndex<Graph2> index;
+    bool mov_success = false;
+    // try {
+    //     index.load(INDEX_FILE, g);
+    //     if (index.get_index_k() != K_INDEX) {
+    //         std::cout << "警告: 加载的索引k值(" << index.get_index_k()
+    //                   << ")与期望值(" << K_INDEX << ")不符。将继续使用加载的索引。" << std::endl;
+    //     }
+    //     else {
+    //         mov_success = true;
+    //     }
+    // } catch (const std::ifstream::failure& e) {}
+
+    if (!mov_success) {
+        std::cout << "未发现索引文件，开始构建新索引..." << std::endl;
+        index = V2VIndex<Graph2>(g, K_INDEX);
+        index.build();
+        if (!index.save(INDEX_FILE)) {
+            std::cerr << "[错误] 无法保存索引到文件: " << INDEX_FILE << std::endl;
+        }
     }
-    load_timer.print_elapsed("图加载耗时: ");
 
-    std::cout << "开始加载对象数据..." << std::endl;
-    load_timer.reset();
-    auto [objects, success2] = load_objects();
-    if (!success2) {
-        std::cerr << "加载对象失败！" << std::endl;
-        return 1;
-    }
-    load_timer.print_elapsed("对象加载耗时: ");
+    // 3. 准备 POI 数据 (这里模拟动态接收)
+    auto [pois, success2] = load_objects();
+    if (!success2) return 1;
+    std::cout << "加载了 " << pois.size() << " 个 POI 对象。" << std::endl;
 
-    // 3. 创建增强图
-    //    新的 POI 顶点 ID 从 5 开始
-    auto [augmented_graph, candidate_objects] = create_augmented_graph(g, objects, g.vertices.size() + 10000);
-
-    // 4. 在增强图上构建索引
-    int k = 20;
-    KnnIndex index(augmented_graph, k, candidate_objects);
-    index.build_index();
-
-    // 5. 进行查询
+    // 4. 创建查询处理器并执行查询
+    KnnQueryProcessor<Graph2> qp(index);
     Vertex query_point = 600;
-    std::cout << "\n--- 查询从顶点 " << query_point << " 出发的 " << k << " 个最近邻居 ---" << std::endl;
-    KnnResult result = index.get_knn(query_point);
 
-    // 6. 打印结果
-    // 注意：结果中的 ID 是 POI 在增强图中的新顶点ID
-    if (result.empty()) {
-        std::cout << "未找到邻居。" << std::endl;
-    } else {
-        std::cout << "查询结果：" << std::endl;
-        for (const auto& neighbor : result) {
-            std::cout << "  - 对象(顶点ID): " << neighbor.id
-                      << ", 距离: " << neighbor.dist << std::endl;
-        }
-    }
+    // 查询1: k < 索引k (纯索引模式)
+    std::cout << "\n--- 查询1: k=10 (小于索引k=" << index.get_index_k() << ") ---" << std::endl;
+    KnnResult result1 = qp.query(query_point, pois, 10);
+    for (const auto& n : result1) std::cout << "  - POI: " << n.id << ", Dist: " << n.dist << std::endl;
 
-    // 示例：查询另一个点 2
-    query_point = 2;
-    std::cout << "\n--- 查询从顶点 " << query_point << " 出发的 " << k << " 个最近邻居 ---" << std::endl;
-    result = index.get_knn(query_point);
-    if (result.empty()) {
-        std::cout << "未找到邻居。" << std::endl;
-    } else {
-        std::cout << "查询结果：" << std::endl;
-        for (const auto& neighbor : result) {
-            std::cout << "  - 对象(顶点ID): " << neighbor.id 
-                      << ", 距离: " << neighbor.dist << std::endl;
-        }
-    }
+    // 查询2: k > 索引k (混合模式)
+    std::cout << "\n--- 查询2: k=100 (大于索引k=" << index.get_index_k() << ") ---" << std::endl;
+    KnnResult result2 = qp.query(query_point, pois, 100);
+    for (const auto& n : result2) std::cout << "  - POI: " << n.id << ", Dist: " << n.dist << std::endl;
 
-    total_timer.print_elapsed("\n程序总运行时间: ");
     return 0;
 }
